@@ -1,12 +1,12 @@
-import os
-import io
-import time
-from urllib.parse import urlparse
+print("=== PhotoRoom Transparent PNG Nodes Loaded ===")
 
-import numpy as np
+import os
+import time
 import requests
 import torch
-from PIL import Image, ImageOps
+import numpy as np
+from PIL import Image
+from io import BytesIO
 
 try:
     import folder_paths
@@ -14,130 +14,131 @@ except Exception:
     folder_paths = None
 
 
-class TransparentPNGDownloader:
-    """Download a PNG/WebP image from a URL, preserve transparency, and output IMAGE + MASK."""
-
-    @classmethod
-    def INPUT_TYPES(cls):
-        return {
-            "required": {
-                "image_url": ("STRING", {"multiline": False, "default": "https://example.com/image.png"}),
-                "filename_prefix": ("STRING", {"default": "transparent_png"}),
-                "timeout": ("INT", {"default": 30, "min": 5, "max": 120, "step": 1}),
-            }
-        }
-
-    RETURN_TYPES = ("IMAGE", "MASK", "STRING")
-    RETURN_NAMES = ("image", "alpha_mask", "saved_path")
-    FUNCTION = "download"
-    CATEGORY = "image/download"
-
-    def _get_output_dir(self):
-        if folder_paths is not None:
-            return folder_paths.get_output_directory()
-        return os.path.join(os.getcwd(), "output")
-
-    def _safe_filename(self, prefix):
-        clean = "".join(c if c.isalnum() or c in "-_" else "_" for c in prefix).strip("_")
-        if not clean:
-            clean = "transparent_png"
-        return f"{clean}_{int(time.time())}.png"
-
-    def _pil_to_comfy(self, pil_image):
-        rgba = pil_image.convert("RGBA")
-
-        rgb = rgba.convert("RGB")
-        image_np = np.asarray(rgb).astype(np.float32) / 255.0
-        image_tensor = torch.from_numpy(image_np)[None,]
-
-        alpha = np.asarray(rgba.getchannel("A")).astype(np.float32) / 255.0
-        # ComfyUI masks normally use white as masked/transparent area.
-        # For alpha compositing later, 1 - alpha is usually expected by SaveImage-style nodes.
-        mask_tensor = torch.from_numpy(1.0 - alpha)[None,]
-        return image_tensor, mask_tensor
-
-    def download(self, image_url, filename_prefix="transparent_png", timeout=30):
-        if not image_url.lower().startswith(("http://", "https://")):
-            raise ValueError("image_url must start with http:// or https://")
-
-        headers = {"User-Agent": "ComfyUI-Transparent-PNG-Downloader/1.0"}
-        response = requests.get(image_url, headers=headers, timeout=timeout)
-        response.raise_for_status()
-
-        image = Image.open(io.BytesIO(response.content))
-        image = ImageOps.exif_transpose(image).convert("RGBA")
-
-        output_dir = self._get_output_dir()
-        os.makedirs(output_dir, exist_ok=True)
-        filename = self._safe_filename(filename_prefix)
-        saved_path = os.path.join(output_dir, filename)
-        image.save(saved_path, "PNG")
-
-        image_tensor, mask_tensor = self._pil_to_comfy(image)
-        return (image_tensor, mask_tensor, saved_path)
-
-
-class SaveTransparentPNG:
-    """Save a ComfyUI IMAGE + MASK as a real transparent PNG."""
-
+class PhotoRoomRemoveBGTransparent:
     @classmethod
     def INPUT_TYPES(cls):
         return {
             "required": {
                 "image": ("IMAGE",),
-                "mask": ("MASK",),
-                "filename_prefix": ("STRING", {"default": "transparent_output"}),
+                "api_key": ("STRING", {"default": ""}),
             }
         }
 
-    RETURN_TYPES = ("STRING",)
-    RETURN_NAMES = ("saved_path",)
-    FUNCTION = "save"
+    RETURN_TYPES = ("IMAGE", "MASK")
+    RETURN_NAMES = ("image", "alpha_mask")
+    FUNCTION = "remove_bg"
+    CATEGORY = "PhotoRoom"
+
+    def remove_bg(self, image, api_key):
+        if not api_key:
+            raise Exception("Please enter your PhotoRoom API key")
+
+        img = image[0].cpu().numpy()
+        img = (img * 255).clip(0, 255).astype(np.uint8)
+        pil_img = Image.fromarray(img).convert("RGB")
+
+        buffer = BytesIO()
+        pil_img.save(buffer, format="PNG")
+        buffer.seek(0)
+
+        response = requests.post(
+            "https://sdk.photoroom.com/v1/segment",
+            headers={
+                "x-api-key": api_key,
+                "Accept": "image/png"
+            },
+            files={
+                "image_file": ("input.png", buffer, "image/png")
+            },
+            timeout=120
+        )
+
+        if response.status_code != 200:
+            raise Exception(f"PhotoRoom API Error {response.status_code}: {response.text}")
+
+        rgba = Image.open(BytesIO(response.content)).convert("RGBA")
+        arr = np.array(rgba).astype(np.float32) / 255.0
+
+        rgb = arr[:, :, :3]
+        alpha = arr[:, :, 3]
+
+        image_tensor = torch.from_numpy(rgb.astype(np.float32))[None,]
+        mask_tensor = torch.from_numpy(alpha.astype(np.float32))[None,]
+
+        return (image_tensor, mask_tensor)
+
+
+class SaveTransparentPNG:
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {
+                "image": ("IMAGE",),
+                "alpha_mask": ("MASK",),
+                "filename_prefix": ("STRING", {"default": "photoroom_transparent"}),
+            }
+        }
+
+    RETURN_TYPES = ()
+    FUNCTION = "save_png"
     OUTPUT_NODE = True
-    CATEGORY = "image/save"
+    CATEGORY = "PhotoRoom"
 
-    def _get_output_dir(self):
+    def save_png(self, image, alpha_mask, filename_prefix):
         if folder_paths is not None:
-            return folder_paths.get_output_directory()
-        return os.path.join(os.getcwd(), "output")
+            output_dir = folder_paths.get_output_directory()
+        else:
+            output_dir = os.path.join(os.getcwd(), "output")
 
-    def _safe_filename(self, prefix, index):
-        clean = "".join(c if c.isalnum() or c in "-_" else "_" for c in prefix).strip("_")
-        if not clean:
-            clean = "transparent_output"
-        return f"{clean}_{int(time.time())}_{index:03d}.png"
-
-    def save(self, image, mask, filename_prefix="transparent_output"):
-        output_dir = self._get_output_dir()
         os.makedirs(output_dir, exist_ok=True)
 
-        saved_paths = []
-        batch_size = image.shape[0]
+        results = []
 
-        for i in range(batch_size):
-            rgb_np = np.clip(255.0 * image[i].cpu().numpy(), 0, 255).astype(np.uint8)
-            rgb = Image.fromarray(rgb_np, "RGB").convert("RGBA")
+        image_np = image.detach().cpu().numpy()
+        mask_np = alpha_mask.detach().cpu().numpy()
 
-            current_mask = mask[i if mask.shape[0] > 1 else 0].cpu().numpy()
-            # In ComfyUI mask: 0 = keep/opaque, 1 = masked/transparent.
-            alpha_np = np.clip((1.0 - current_mask) * 255.0, 0, 255).astype(np.uint8)
-            alpha = Image.fromarray(alpha_np, "L").resize(rgb.size)
-            rgb.putalpha(alpha)
+        batch = image_np.shape[0]
 
-            filename = self._safe_filename(filename_prefix, i)
-            saved_path = os.path.join(output_dir, filename)
-            rgb.save(saved_path, "PNG")
-            saved_paths.append(saved_path)
+        for i in range(batch):
+            rgb = (image_np[i] * 255).clip(0, 255).astype(np.uint8)
 
-        return ("\n".join(saved_paths),)
+            mask = mask_np[i]
+            if mask.ndim == 3:
+                mask = mask[:, :, 0]
+
+            alpha = (mask * 255).clip(0, 255).astype(np.uint8)
+
+            if alpha.shape[:2] != rgb.shape[:2]:
+                alpha_img = Image.fromarray(alpha).resize(
+                    (rgb.shape[1], rgb.shape[0]),
+                    Image.Resampling.LANCZOS
+                )
+                alpha = np.array(alpha_img).astype(np.uint8)
+
+            rgba = np.dstack((rgb, alpha))
+            pil = Image.fromarray(rgba, mode="RGBA")
+
+            timestamp = int(time.time() * 1000)
+            filename = f"{filename_prefix}_{timestamp}_{i:03d}.png"
+            filepath = os.path.join(output_dir, filename)
+
+            pil.save(filepath, "PNG")
+
+            results.append({
+                "filename": filename,
+                "subfolder": "",
+                "type": "output"
+            })
+
+        return {"ui": {"images": results}}
 
 
 NODE_CLASS_MAPPINGS = {
-    "TransparentPNGDownloader": TransparentPNGDownloader,
+    "PhotoRoomRemoveBGTransparent": PhotoRoomRemoveBGTransparent,
     "SaveTransparentPNG": SaveTransparentPNG,
 }
 
 NODE_DISPLAY_NAME_MAPPINGS = {
-    "TransparentPNGDownloader": "Download Transparent PNG",
+    "PhotoRoomRemoveBGTransparent": "PhotoRoom Remove Background Transparent",
     "SaveTransparentPNG": "Save Transparent PNG",
 }
